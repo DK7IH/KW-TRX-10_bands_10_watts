@@ -43,7 +43,7 @@
 
 //I2C
 #define EEPROM_ADR   0xA0
-#define MCP4725_ADR  0xC0; //C0 with "ADDR" on chip open or GND, C1 with tied to VDD;
+#define MCP4725_ADR  0xC0U //C0 with "ADDR" on chip open or GND, C1 with tied to VDD;
   
 ////////////////
 //Declarations//
@@ -144,7 +144,6 @@ int get_adc(int);
 int get_keys(void);
 int get_pa_temp(void);
 int get_vdd(void);
-int get_txpwr(void);
 int get_txrx(void);
 
 //Radio
@@ -152,11 +151,16 @@ void spi_send_byte(unsigned int);
 void set_frequency(long);
 void set_clock_multiplier(void);
 void set_band_relay(int);
+void set_tx_pwr(int);
 
 //Interrupt handlers
 extern "C" void EXTI0_IRQHandler(void);
 extern "C" void TIM2_IRQHandler(void);
 
+//EEPROM byte usage:
+//0...479: Frequenies of 12 VFOs for 10 bands (4 bytes each)
+//1023, 1024: last VFO and band used
+//1048...1072: TX power values (2 bytes for each band)
 //EEPROM etc.
 int eeprom_read(int mem_address);
 void eeprom_write(int, int);
@@ -169,6 +173,8 @@ void store_last_vfo(int);
 int load_last_vfo(void);
 void eeprom_erase(void);
 int is_freq_ok(long, int);
+void store_tx_preset(int, int);
+int load_tx_preset(int);
 
 //I2C
 void i2c_start(void);
@@ -177,7 +183,7 @@ void i2c_write_byte1(uint8_t, uint8_t, int);
 void i2c_write_byte2(uint8_t*, uint8_t, int);
 int16_t i2c_read1(uint8_t, int); 
 int16_t i2c_read2(uint16_t, int); 
-void mcp4725(uint8_t, uint8_t, uint8_t);
+void i2c_write_mcp4725(uint8_t, uint8_t, uint8_t);
  
 
 //MISC
@@ -978,6 +984,7 @@ int get_keys(void)
     int key_value[] = {0, 365, 675, 935, 1159};
     int t1;
     int adcval0;
+    long runsecsx = runsecs;
     
     adcval0 = get_adc(KEYS);
     
@@ -990,8 +997,20 @@ int get_keys(void)
     {
 		if((adcval0 > (key_value[t1] - 10)) && (adcval0 < (key_value[t1] + 10)))
 		{
-			return t1;
-		}    
+			adcval0 = get_adc(KEYS);
+		    while((adcval0 > (key_value[t1] - 10)) && (adcval0 < (key_value[t1] + 10)))
+		    {
+				adcval0 = get_adc(KEYS);
+			}	
+		    if((runsecs - runsecsx) < 1)
+		    {
+				return t1;
+			}	
+			else			
+			{
+				return t1 + 5;
+			}    
+		}	
     }
     return -1;
 }
@@ -1149,6 +1168,14 @@ void set_band_relay(int b)
 	 }   	     
 }	
 
+//4095 = max. TX drive
+void set_tx_pwr(int fpwr)
+{
+	int value = 4095 - fpwr;
+	
+	i2c_write_mcp4725(64, (value >> 4) & 0xFF, value & 0xF0);
+}	
+
   ////////////////////////////////////
  //   EEPROM & Mem functions       //
 ////////////////////////////////////
@@ -1275,6 +1302,32 @@ int eeprom_read(int mem_address)
    
    return r;
 }
+
+void store_tx_preset(int band, int value)
+{
+	int lb, hb;
+	int addr = 1048 + band * 2;
+	lb = value & 0xFF;
+	hb = (value >> 8) & 0x0F;
+	
+	eeprom_write(addr, hb);
+	eeprom_write(addr + 1, lb);
+}
+	
+int load_tx_preset(int band)
+{
+	int addr = 1048 + band * 2;
+	int hb = eeprom_read(addr);
+	int lb = eeprom_read(addr + 1);
+	int tx_pwr = (hb << 8) + lb;
+	
+	if((tx_pwr < 0) || (tx_pwr > 4095))
+	{
+		tx_pwr = 2048;
+	}	
+	
+	return tx_pwr;
+}	
 
   //////////////////////
  //   I2C commands   //
@@ -1421,9 +1474,8 @@ int16_t i2c_read2(uint16_t regaddr, int i2c_adr)
     return reg;
 }
 
-
-//Set MCP4724 DAC with 3 parameters according to datasheet
-void mcp4725(uint8_t data0, uint8_t data1, uint8_t data2) 
+//For MCP4724 DAC with 3 parameters according to datasheet
+void i2c_write_mcp4725(uint8_t data0, uint8_t data1, uint8_t data2) 
 {
     //Send start signal
     i2c_start();
@@ -1464,8 +1516,17 @@ int main(void)
 	long runsecs_meas = 0;
 	long runsecs_msg = 0;
 	
+	//Scan operation
+	int cur_vfo2 = 0;
+	long ftemp = 0;
+	long runsecs_scan = 0;
+	
+	//TX PWR setting
+	int tx_pwr;
+	int xpos = 0;
+	
 	/////////////////////////////////////////////
-    // Set SystemClock to 50 MHz with 25 MHz HSE
+    // Set SystemClock to 168 MHz with 25 MHz HSE
     //////////////////////////////////////////////
     FLASH->ACR |= (1 << 1);                     //2 wait states for 96+ MHz
     RCC->CR |= (1 << 16);                       //Activate external clock (HSE: 25 MHz)
@@ -1569,7 +1630,7 @@ int main(void)
     
     //Timer calculation
     //Timer update frequency = TIM_CLK/(TIM_PSC+1)/(TIM_ARR + 1) 
-    TIM2->PSC = 10000-1;   //Divide system clock (f=100MHz) by 10000 -> update frequency = 10000/s
+    TIM2->PSC = 16800-1;   //Divide system clock (f=168MHz) by 16800 -> update frequency = 10000/s
     TIM2->ARR = 3500;      //Define overrun
 
     //Update Interrupt Enable
@@ -1694,11 +1755,14 @@ int main(void)
     show_tunspeed(tunspeed);
     lcd_drawhline(0, 160, 19, LIGHTBLUE);
     lcd_drawhline(0, 160, 75, LIGHTBLUE);
-    show_msg((char*)"VFOs...     ");
-    
+        
     //Load rest of VFOs
     for(t0 = 0; t0 < MAXBANDS; t0++)
 	{
+		if(t0 == 5)
+		{
+			show_msg((char*)"VFOs...     ");
+		}	
 	    for(t1 = 0; t1 < MAXVFO; t1++)
 		{	
 			f_vfo[t0][t1] = load_frequency(t0, t1);
@@ -1708,6 +1772,8 @@ int main(void)
 	        }	
 		}
 	}		
+    
+    set_tx_pwr(load_tx_preset(cur_band));
     
     show_msg((char*)"V 23-OCT-11");
     
@@ -1756,7 +1822,7 @@ int main(void)
 					show_frequency(f_vfo[cur_band][cur_vfo]);
 					show_band(cur_band);
 					set_band_relay(cur_band);
-	                   show_sideband(pref_sideband[cur_band]);
+	                show_sideband(pref_sideband[cur_band]);
 					//mcp4725_setvalue(load_txdrvive(cur_band));
 					store_last_band(cur_band);
 					break;
@@ -1838,6 +1904,96 @@ int main(void)
 					delay(100);
 					runsecs_msg = runsecs;
 					break;			
+					
+					//Scan all VFOs of local band
+			case 7: show_msg((char*)"Scan       ");
+			        key = get_keys();
+			        cur_vfo2 = cur_vfo;
+			        while(key == -1)
+			        {
+			        	ftemp = load_frequency(cur_band, cur_vfo2);
+						if(!is_freq_ok(ftemp, cur_band))
+					    {
+						    ftemp = f_cntr[cur_band];
+					    }
+						show_vfo(cur_vfo2);
+						set_frequency(ftemp);
+					    show_frequency(ftemp);
+					    runsecs_scan = runsecs;
+					    
+					    if(cur_vfo2 < MAXVFO) //VFO select
+		                {  
+						    cur_vfo2++;
+					    }
+					    else	
+					    {
+						    cur_vfo2 = 0;
+					    }
+					    
+					    while(((runsecs - runsecs_scan) < 7) && (key == -1))
+					    {
+							lcd_putstring((4 + runsecs - runsecs_scan) * FONTWIDTH, 0, (char*)".", 1, LIGHTGRAY, bgcolor);
+							if(GPIOA->IDR & (1 << 7)) //PTT pressed
+							{
+								key = 4;
+							}
+							else
+							{		
+							    key = get_keys();
+							}    
+						}	
+						show_msg((char*)"Scan       ");
+					}    
+					
+					if(key == 4) //Change to scan result VFO frequency
+					{
+					    cur_vfo = cur_vfo2; 
+					    f_vfo[cur_band][cur_vfo] = ftemp;
+			        }
+			        show_vfo(cur_vfo); 
+				    set_frequency(f_vfo[cur_band][cur_vfo]);
+					show_frequency(f_vfo[cur_band][cur_vfo]);            
+					
+					break;
+					
+					//Set TX drive power
+			case 8: while(get_keys() > -1);
+			        show_msg((char*)"TX PWR;    ");
+			        //Load value
+			        tx_pwr = load_tx_preset(cur_band) * 100 / 4095;
+			        
+			        xpos = lcd_putnumber(7 * FONTWIDTH, 0, tx_pwr, -1, 1, LIGHTGRAY, bgcolor);
+					lcd_putstring((7 + xpos) * FONTWIDTH, 0, (char*)"%", 1, LIGHTGRAY, bgcolor);
+							
+			        set_tx_pwr(tx_pwr);
+			        while(get_keys() == -1)
+			        {
+						if(tuning)
+						{
+							tx_pwr += (tuning * -1);
+							if(tx_pwr < 0)
+							{
+								tx_pwr = 0;
+							}	
+							if(tx_pwr > 100)
+							{
+								tx_pwr = 100;
+							}
+							set_tx_pwr(tx_pwr * 4095 / 100);
+							show_msg((char*)"TX PWR;    ");
+							xpos = lcd_putnumber(7 * FONTWIDTH, 0, tx_pwr, -1, 1, LIGHTGRAY, bgcolor);
+							lcd_putstring((7 + xpos) * FONTWIDTH, 0, (char*)"%", 1, LIGHTGRAY, bgcolor);
+							tuning = 0;
+							
+						}	
+					}	
+					store_tx_preset(cur_band, tx_pwr * 4095 / 100);
+					show_msg((char*)"Done.      ");
+					runsecs_msg = runsecs;
+					break;	
+			        
+					
+
 		}					
 		
 		//Show VDD, PATMP every 10 secs
